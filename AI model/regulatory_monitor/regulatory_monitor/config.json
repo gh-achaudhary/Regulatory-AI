@@ -1,0 +1,8 @@
+{
+  "user_agent": "RegMonitor/1.0 (+compliance-monitoring)",
+  "timeout_seconds": 20,
+  "max_pages_per_site": 25,
+  "crawl_depth": 2,
+  "concurrency": 4,
+  "respect_robots": true
+}

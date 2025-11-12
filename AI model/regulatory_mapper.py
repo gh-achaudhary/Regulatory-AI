@@ -1,0 +1,413 @@
+# regulatory_mapper.py
+# Phase 1: Identify regulators and map IVD/QMS sources for 33 countries.
+# Run this file to build:
+#   - data/countries_config.json  . master configuration for Phase 2+
+#   - data/verification_report.csv . audit-friendly summary
+
+import os
+import re
+import json
+import time
+import csv
+import queue
+import hashlib
+import threading
+from dataclasses import dataclass, asdict, field
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from langdetect import detect, LangDetectException
+import tldextract
+from slugify import slugify
+from tqdm import tqdm
+from typing import Optional
+
+# ----------------------------
+# Load runtime configuration
+# ----------------------------
+CONFIG_PATH = "config.json"
+DATA_DIR = "data"
+LOG_DIR = "logs"
+COUNTRIES_CONFIG_OUT = os.path.join(DATA_DIR, "countries_config.json")
+VERIFICATION_CSV_OUT = os.path.join(DATA_DIR, "verification_report.csv")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    APP_CFG = json.load(f)
+
+HEADERS = {
+    "User-Agent": APP_CFG.get("user_agent", "RegMonitor/1.0"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+TIMEOUT = APP_CFG.get("timeout_seconds", 20)
+
+# ----------------------------
+# Seed authorities . authoritative names matter for auditors
+# main_url should be the regulator root or medical-device hub
+# ----------------------------
+SEED = [
+    # Americas
+    {"country": "United States", "authority": "FDA . Center for Devices and Radiological Health . CDRH", "main_url": "https://www.fda.gov/medical-devices"},
+    {"country": "Canada", "authority": "Health Canada . Medical Devices", "main_url": "https://www.canada.ca/en/health-canada/services/medical-devices.html"},
+    {"country": "Mexico", "authority": "COFEPRIS", "main_url": "https://www.gob.mx/cofepris"},
+    {"country": "Brazil", "authority": "ANVISA", "main_url": "https://www.gov.br/anvisa/pt-br"},
+    {"country": "Chile", "authority": "Instituto de Salud Pública de Chile . ISP", "main_url": "https://www.ispch.cl"},
+    {"country": "Ecuador", "authority": "ARCSA", "main_url": "https://www.controlsanitario.gob.ec"},
+    {"country": "Guatemala", "authority": "MSPAS . Ministerio de Salud Pública y Asistencia Social", "main_url": "https://www.mspas.gob.gt"},
+    # Europe
+    {"country": "United Kingdom", "authority": "MHRA", "main_url": "https://www.gov.uk/government/organisations/medicines-and-healthcare-products-regulatory-agency"},
+    {"country": "Germany", "authority": "BfArM", "main_url": "https://www.bfarm.de"},
+    {"country": "France", "authority": "ANSM", "main_url": "https://ansm.sante.fr"},
+    {"country": "Italy", "authority": "Ministero della Salute . Dispositivi medici", "main_url": "https://www.salute.gov.it"},
+    {"country": "Spain", "authority": "AEMPS", "main_url": "https://www.aemps.gob.es"},
+    {"country": "Netherlands", "authority": "IGJ . Health and Youth Care Inspectorate", "main_url": "https://english.igj.nl"},
+    {"country": "Belgium", "authority": "FAMHP . AFMPS . FAMHP . Federal Agency for Medicines and Health Products", "main_url": "https://www.famhp.be"},
+    {"country": "Ireland", "authority": "HPRA", "main_url": "https://www.hpra.ie"},
+    {"country": "Norway", "authority": "Norwegian Directorate of Health . Helsedirektoratet", "main_url": "https://www.helsedirektoratet.no"},
+    {"country": "Finland", "authority": "Valvira . National Supervisory Authority for Welfare and Health", "main_url": "https://www.valvira.fi"},
+    {"country": "Romania", "authority": "ANMDMR", "main_url": "https://www.anmdmr.ro"},
+    {"country": "Switzerland", "authority": "Swissmedic", "main_url": "https://www.swissmedic.ch"},
+    # Middle East . Asia . Pacific
+    {"country": "United Arab Emirates", "authority": "MOHAP . Ministry of Health and Prevention", "main_url": "https://www.mohap.gov.ae"},
+    {"country": "Turkey", "authority": "TITCK", "main_url": "https://www.titck.gov.tr"},
+    {"country": "Israel", "authority": "AMAR . Medical Devices Division . Israel Ministry of Health", "main_url": "https://www.gov.il/en/departments/medical_devices"},
+    {"country": "Iran (Islamic Republic of)", "authority": "IFDA . Iran Food and Drug Administration", "main_url": "https://www.fda.gov.ir"},
+    {"country": "India", "authority": "CDSCO", "main_url": "https://cdsco.gov.in"},
+    {"country": "China", "authority": "NMPA", "main_url": "https://www.nmpa.gov.cn"},
+    {"country": "Japan", "authority": "PMDA", "main_url": "https://www.pmda.go.jp"},
+    {"country": "Korea (Republic of)", "authority": "MFDS", "main_url": "https://www.mfds.go.kr"},
+    {"country": "Taiwan", "authority": "TFDA", "main_url": "https://www.fda.gov.tw"},
+    {"country": "Thailand", "authority": "Thai FDA", "main_url": "https://www.fda.moph.go.th"},
+    {"country": "Philippines", "authority": "FDA Philippines", "main_url": "https://www.fda.gov.ph"},
+    {"country": "Hong Kong", "authority": "Medical Device Division . Department of Health", "main_url": "https://www.mdd.gov.hk"},
+    {"country": "Singapore", "authority": "HSA . Health Sciences Authority", "main_url": "https://www.hsa.gov.sg"},
+    {"country": "Australia", "authority": "TGA", "main_url": "https://www.tga.gov.au"},
+    # Other EU
+    {"country": "Switzerland", "authority": "Swissmedic", "main_url": "https://www.swissmedic.ch"},  # duplicate guarded later
+]
+
+# Ensure unique by country . keep first occurrence
+seen = set()
+UNIQUE_SEED = []
+for item in SEED:
+    if item["country"] not in seen:
+        UNIQUE_SEED.append(item)
+        seen.add(item["country"])
+
+ALL_COUNTRIES = {
+    "United States","United Kingdom","Japan","United Arab Emirates","Korea (Republic of)","India",
+    "China","Italy","Switzerland","Taiwan","Spain","Turkey","Israel","Germany","Canada","Netherlands",
+    "Thailand","France","Philippines","Hong Kong","Singapore","Australia","Mexico","Brazil","Belgium",
+    "Iran (Islamic Republic of)","Ireland","Norway","Ecuador","Guatemala","Finland","Chile","Romania"
+}
+
+# ----------------------------
+# Keyword banks . English + common local terms for IVD and QMS
+# This is intentionally conservative and easily extensible
+# ----------------------------
+IVD_KEYWORDS = {
+    "default": ["ivd","in vitro diagnostic","in-vitro diagnostic","medical device","devices","diagnostic"],
+    "de": ["in-vitro-diagnostika","ivd","medizinprodukte"],
+    "fr": ["diagnostic in vitro","dispositifs médicaux","DIV"],
+    "es": ["diagnóstico in vitro","dispositivos médicos","DIV"],
+    "it": ["diagnostici in vitro","dispositivi medici","DIV"],
+    "pt": ["diagnóstico in vitro","dispositivos médicos","DIV"],
+    "nl": ["in-vitrodiagnostiek","medische hulpmiddelen"],
+    "sv": ["in vitro-diagnostik","medicintekniska produkter"],
+    "fi": ["in vitro -diagnostiikka","terveydenhuollon laitteet"],
+    "no": ["in vitro-diagnostikk","medisinsk utstyr"],
+    "da": ["in vitro-diagnostik","medicinsk udstyr"],
+    "tr": ["vitro tanı","tıbbi cihaz"],
+    "pl": ["diagnostyka in vitro","wyroby medyczne"],
+    "ja": ["体外診断","医療機器"],
+    "ko": ["체외진단","의료기기"],
+    "zh": ["体外诊断","医疗器械","體外診斷","醫療器械"],
+    "ar": ["التشخيص خارج الجسم","الأجهزة الطبية"],
+    "he": ["אבחון חוץ גופי","ציוד רפואי"]
+}
+QMS_KEYWORDS = {
+    "default": ["qms","quality management system","quality system","gmp","gxp","iso 13485","quality manual","good manufacturing practice"],
+    "de": ["qualitätsmanagement","qualitätssystem","iso 13485"],
+    "fr": ["système de gestion de la qualité","smq","iso 13485","qualité"],
+    "es": ["sistema de gestión de calidad","iso 13485","calidad"],
+    "it": ["sistema di gestione della qualità","sgq","iso 13485"],
+    "pt": ["sistema de gestão da qualidade","iso 13485"],
+    "tr": ["kalite yönetim sistemi","iso 13485"],
+    "ja": ["品質マネジメントシステム","品質システム","ISO 13485"],
+    "ko": ["품질경영시스템","품질시스템","ISO 13485"],
+    "zh": ["质量管理体系","質量管理體系","质量体系","ISO 13485"],
+    "ar": ["نظام إدارة الجودة","ايزو 13485"],
+    "he": ["מערכת ניהול איכות","ISO 13485"]
+}
+
+RSS_HINTS = ["rss","feed","atom","/rss","/feed","/atom"]
+
+# ----------------------------
+# Data structures
+# ----------------------------
+@dataclass
+class SourceEntry:
+    country: str
+    regulatory_authority: str
+    main_url: str
+    ivd_page: Optional[str] = None
+    qms_page: Optional[str] = None
+    api_available: bool = False
+    rss_feed: Optional[str] = None
+    scraping_method: str = "beautifulsoup"
+    primary_language: Optional[str] = None
+    english_available: Optional[bool] = None
+    last_checked: Optional[str] = None
+    check_frequency: str = "monthly"
+    notes: Optional[str] = None
+
+@dataclass
+class VerificationRow:
+    country: str
+    authority: str
+    main_url_status: str
+    pages_scanned: int
+    ivd_found: bool
+    qms_found: bool
+    rss_found: bool
+    detected_languages: str
+    remarks: str
+
+# ----------------------------
+# Utility functions
+# ----------------------------
+def http_get(url: str) -> Optional[requests.Response]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        return resp
+    except requests.RequestException:
+        return None
+
+def clean_text(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip()
+
+def guess_lang(text: str) -> Optional[str]:
+    try:
+        return detect(text)
+    except LangDetectException:
+        return None
+
+def has_rss_links(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    for link in soup.find_all("link", {"type": ["application/rss+xml","application/atom+xml"]}):
+        href = link.get("href")
+        if href:
+            return urljoin(base_url, href)
+    # heuristic check
+    for a in soup.find_all("a", href=True):
+        href = a["href"].lower()
+        if any(h in href for h in RSS_HINTS):
+            return urljoin(base_url, a["href"])
+    return None
+
+def within_domain(href: str, root: str) -> bool:
+    try:
+        root_host = tldextract.extract(root)
+        href_host = tldextract.extract(href)
+        return (root_host.domain == href_host.domain) and (root_host.suffix == href_host.suffix)
+    except Exception:
+        return False
+
+def likely_match(text: str, lang: str, bucket: dict) -> bool:
+    text_l = text.lower()
+    keys = bucket.get(lang, []) + bucket.get("default", [])
+    return any(k.lower() in text_l for k in keys)
+
+def find_candidate_pages(base_url: str, html: str, lang_hint: Optional[str] = None) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = {"ivd": [], "qms": []}
+    # collect visible links on home page
+    for a in soup.find_all("a", href=True):
+        label = clean_text(a.get_text(" ") or "")
+        href = urljoin(base_url, a["href"])
+        if not within_domain(href, base_url):
+            continue
+        # restrict to likely docs / guidance hubs
+        label_l = label.lower()
+        if len(label_l) < 3:
+            continue
+        lang = lang_hint or guess_lang(label) or "default"
+        if likely_match(label_l, lang, IVD_KEYWORDS):
+            candidates["ivd"].append({"href": href, "label": label})
+        if likely_match(label_l, lang, QMS_KEYWORDS):
+            candidates["qms"].append({"href": href, "label": label})
+    return candidates
+
+def crawl_for_keywords(start_url: str, depth: int = 1, limit: int = 10, lang_hint: Optional[str] = None) -> dict:
+    visited = set()
+    q = queue.Queue()
+    q.put((start_url, 0))
+    found = {"ivd": None, "qms": None, "rss": None, "languages": set(), "scanned": 0}
+
+    while not q.empty() and found["scanned"] < limit:
+        url, d = q.get()
+        if url in visited or d > depth:
+            continue
+        visited.add(url)
+        resp = http_get(url)
+        if not resp or "text/html" not in resp.headers.get("Content-Type",""):
+            continue
+        html = resp.text
+        found["scanned"] += 1
+        soup = BeautifulSoup(html, "html.parser")
+        text_sample = clean_text(soup.get_text(" ", strip=True)[:2000])
+        lang = lang_hint or guess_lang(text_sample) or "default"
+        found["languages"].add(lang)
+
+        # discover rss
+        if not found["rss"]:
+            found["rss"] = has_rss_links(soup, resp.url)
+
+        # look for candidates on this page
+        cand = find_candidate_pages(resp.url, html, lang)
+        if cand["ivd"] and not found["ivd"]:
+            found["ivd"] = cand["ivd"][0]["href"]
+        if cand["qms"] and not found["qms"]:
+            found["qms"] = cand["qms"][0]["href"]
+
+        # enqueue more links for shallow crawl
+        for a in soup.find_all("a", href=True):
+            href = urljoin(resp.url, a["href"])
+            if within_domain(href, start_url) and href not in visited:
+                q.put((href, d + 1))
+
+        # if we already found good signals, we can stop early
+        if found["ivd"] and found["qms"]:
+            break
+
+    return found
+
+# ----------------------------
+# Main mapping routine
+# ----------------------------
+def map_regulators():
+    rows: list[VerificationRow] = []
+    output: list[dict] = []
+
+    # Build a dictionary for quick presence check
+    seed_by_country = {s["country"]: s for s in UNIQUE_SEED}
+    missing = sorted(list(ALL_COUNTRIES - set(seed_by_country.keys())))
+    if missing:
+        # Add minimal placeholders. These will likely need manual review later
+        for c in missing:
+            seed_by_country[c] = {"country": c, "authority": "", "main_url": ""}
+
+    for country in tqdm(sorted(seed_by_country.keys()), desc="Mapping"):
+        item = seed_by_country[country]
+        authority = item.get("authority","").strip() or "TBD"
+        main_url = item.get("main_url","").strip()
+
+        remarks = []
+        ivd_found = False
+        qms_found = False
+        rss_found = False
+        page_count = 0
+        detected_langs = set()
+        primary_lang = None
+        english_available = None
+        ivd_page = None
+        qms_page = None
+        rss_url = None
+        main_status = "MISSING"
+
+        if not main_url:
+            rows.append(VerificationRow(
+                country=country, authority=authority, main_url_status=main_status,
+                pages_scanned=0, ivd_found=False, qms_found=False, rss_found=False,
+                detected_languages="", remarks="No main_url in seed . add manually"
+            ))
+            output.append(asdict(SourceEntry(
+                country=country, regulatory_authority=authority, main_url="",
+                ivd_page=None, qms_page=None, api_available=False, rss_feed=None,
+                scraping_method="beautifulsoup", primary_language=None,
+                english_available=None, last_checked=time.strftime("%Y-%m-%d"),
+                check_frequency="monthly", notes="Missing seed . fill in"
+            )))
+            continue
+
+        resp = http_get(main_url)
+        if resp and resp.status_code < 400 and "text/html" in resp.headers.get("Content-Type",""):
+            main_status = f"{resp.status_code}"
+            html = resp.text
+            # quick language guess from landing page text
+            soup = BeautifulSoup(html, "html.parser")
+            sample = clean_text(soup.get_text(" ", strip=True)[:2000])
+            lang_guess = guess_lang(sample) or "default"
+            if lang_guess != "default":
+                primary_lang = lang_guess
+
+            # heuristic: English version present
+            english_available = any("english" in (a.get_text(" ") or "").lower() for a in soup.find_all("a"))
+
+            # first pass . scan homepage for candidates
+            cand = find_candidate_pages(resp.url, html, primary_lang)
+            # shallow crawl inside domain to improve confidence
+            crawl = crawl_for_keywords(resp.url,
+                                       depth=int(APP_CFG.get("crawl_depth", 2)),
+                                       limit=int(APP_CFG.get("max_pages_per_site", 25)),
+                                       lang_hint=primary_lang)
+            ivd_page = (cand["ivd"][0]["href"] if cand["ivd"] else None) or crawl["ivd"]
+            qms_page = (cand["qms"][0]["href"] if cand["qms"] else None) or crawl["qms"]
+            rss_url = crawl["rss"]
+            page_count = crawl["scanned"]
+            detected_langs = crawl["languages"]
+            ivd_found = bool(ivd_page)
+            qms_found = bool(qms_page)
+            rss_found = bool(rss_url)
+        else:
+            status = resp.status_code if resp else "request_error"
+            main_status = str(status)
+            remarks.append("Failed to load main_url")
+
+        entry = SourceEntry(
+            country=country,
+            regulatory_authority=authority,
+            main_url=main_url,
+            ivd_page=ivd_page,
+            qms_page=qms_page,
+            api_available=False,  # conservative default . APIs are uncommon for these pages
+            rss_feed=rss_url,
+            scraping_method="beautifulsoup",
+            primary_language=primary_lang,
+            english_available=english_available,
+            last_checked=time.strftime("%Y-%m-%d"),
+            check_frequency="monthly",
+            notes="; ".join(remarks) if remarks else None
+        )
+        output.append(asdict(entry))
+        rows.append(VerificationRow(
+            country=country, authority=authority, main_url_status=main_status,
+            pages_scanned=page_count, ivd_found=ivd_found, qms_found=qms_found,
+            rss_found=rss_found, detected_languages=",".join(sorted(detected_langs)) if detected_langs else "",
+            remarks="; ".join(remarks) if remarks else ""
+        ))
+
+    # Write outputs
+    with open(COUNTRIES_CONFIG_OUT, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    with open(VERIFICATION_CSV_OUT, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["country","authority","main_url_status","pages_scanned","ivd_found","qms_found","rss_found","detected_languages","remarks"])
+        for r in rows:
+            writer.writerow([r.country, r.authority, r.main_url_status, r.pages_scanned, r.ivd_found, r.qms_found, r.rss_found, r.detected_languages, r.remarks])
+
+    print(f"\n✔ Wrote {COUNTRIES_CONFIG_OUT}")
+    print(f"✔ Wrote {VERIFICATION_CSV_OUT}")
+    # Quick summary for the console
+    total = len(rows)
+    ok = sum(1 for r in rows if r.main_url_status.isdigit() and int(r.main_url_status) < 400)
+    print(f"\nSummary: {ok}/{total} main URLs reachable")
+    ivd = sum(1 for r in rows if r.ivd_found)
+    qms = sum(1 for r in rows if r.qms_found)
+    print(f"IVD candidates found for {ivd} countries . QMS candidates found for {qms} countries")
+
+if __name__ == "__main__":
+    map_regulators()
