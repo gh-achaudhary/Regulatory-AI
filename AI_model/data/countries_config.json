@@ -183,16 +183,16 @@
     "country": "India",
     "regulatory_authority": "CDSCO",
     "main_url": "https://cdsco.gov.in",
-    "ivd_page": null,
-    "qms_page": null,
+    "ivd_page": "https://cdsco.gov.in/opencms/opencms/en/Acts-and-rules/Medical-Devices-Rules/",
+    "qms_page": "https://cdsco.gov.in/opencms/opencms/en/Home/",
     "api_available": false,
     "rss_feed": null,
     "scraping_method": "beautifulsoup",
-    "primary_language": null,
-    "english_available": null,
+    "primary_language": "en",
+    "english_available": false,
     "last_checked": "2025-11-12",
     "check_frequency": "monthly",
-    "notes": "Failed to load main_url"
+    "notes": null
   },
   {
     "country": "Iran (Islamic Republic of)",

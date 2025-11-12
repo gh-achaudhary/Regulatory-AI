@@ -11,7 +11,7 @@ France,ANSM,200,12,True,True,True,fr,
 Germany,BfArM,200,2,True,False,False,de,
 Guatemala,MSPAS . Ministerio de Salud Pública y Asistencia Social,200,25,False,False,False,es,
 Hong Kong,Medical Device Division . Department of Health,200,1,False,False,False,en,
-India,CDSCO,request_error,0,False,False,False,,Failed to load main_url
+India,CDSCO,200,1,True,True,False,en,
 Iran (Islamic Republic of),IFDA . Iran Food and Drug Administration,request_error,0,False,False,False,,Failed to load main_url
 Ireland,HPRA,200,25,True,False,True,en,
 Israel,AMAR . Medical Devices Division . Israel Ministry of Health,request_error,0,False,False,False,,Failed to load main_url
