@@ -1,9 +1,0 @@
-requests
-beautifulsoup4
-pandas
-tqdm
-tldextract
-python-slugify
-langdetect
-python-dotenv
-lxml
